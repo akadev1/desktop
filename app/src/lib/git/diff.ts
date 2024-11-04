@@ -25,7 +25,6 @@ import { spawnAndComplete } from './spawn'
 
 import { DiffParser } from '../diff-parser'
 import { getOldPathOrDefault } from '../get-old-path'
-import { getCaptures } from '../helpers/regex'
 import { readFile } from 'fs/promises'
 import { forceUnwrap } from '../fatal-error'
 import { git } from './core'
@@ -34,6 +33,9 @@ import { GitError } from 'dugite'
 import { IChangesetData, parseRawLogWithNumstat } from './log'
 import { getConfigValue } from './config'
 import { getMergeBase } from './merge'
+import { IStatusEntry } from '../status-parser'
+import { createLogParser } from './git-delimiter-parser'
+import { enableImagePreviewsForDDSFiles } from '../feature-flag'
 
 /**
  * V8 has a limit on the size of string it can create (~256MB), and unless we want to
@@ -97,6 +99,10 @@ const imageFileExtensions = new Set([
   '.bmp',
   '.avif',
 ])
+
+if (enableImagePreviewsForDDSFiles()) {
+  imageFileExtensions.add('.dds')
+}
 
 /**
  * Render the difference between a file in the given commit and its parent
@@ -522,6 +528,9 @@ function getMediaType(extension: string) {
   if (extension === '.avif') {
     return 'image/avif'
   }
+  if (extension === '.dds') {
+    return 'image/vnd-ms.dds'
+  }
 
   // fallback value as per the spec
   return 'text/plain'
@@ -679,6 +688,7 @@ export async function getBlobImage(
   const extension = Path.extname(path)
   const contents = await getBlobContents(repository, commitish, path)
   return new Image(
+    contents.buffer,
     contents.toString('base64'),
     getMediaType(extension),
     contents.length
@@ -699,6 +709,7 @@ export async function getWorkingDirectoryImage(
 ): Promise<Image> {
   const contents = await readFile(Path.join(repository.path, file.path))
   return new Image(
+    contents.buffer,
     contents.toString('base64'),
     getMediaType(Path.extname(file.path)),
     contents.length
@@ -716,20 +727,51 @@ export async function getWorkingDirectoryImage(
  */
 export async function getBinaryPaths(
   repository: Repository,
-  ref: string
+  ref: string,
+  conflictedFilesInIndex: ReadonlyArray<IStatusEntry>
 ): Promise<ReadonlyArray<string>> {
+  const [detectedBinaryFiles, conflictedFilesUsingBinaryMergeDriver] =
+    await Promise.all([
+      getDetectedBinaryFiles(repository, ref),
+      getFilesUsingBinaryMergeDriver(repository, conflictedFilesInIndex),
+    ])
+
+  return Array.from(
+    new Set([...detectedBinaryFiles, ...conflictedFilesUsingBinaryMergeDriver])
+  )
+}
+
+/**
+ * Runs diff --numstat to get the list of files that have changed and which
+ * Git have detected as binary files
+ */
+async function getDetectedBinaryFiles(repository: Repository, ref: string) {
   const { output } = await spawnAndComplete(
     ['diff', '--numstat', '-z', ref],
     repository.path,
     'getBinaryPaths'
   )
-  const captures = getCaptures(output.toString('utf8'), binaryListRegex)
-  if (captures.length === 0) {
-    return []
-  }
-  // flatten the list (only does one level deep)
-  const flatCaptures = captures.reduce((acc, val) => acc.concat(val))
-  return flatCaptures
+
+  return Array.from(output.toString().matchAll(binaryListRegex), m => m[1])
 }
 
 const binaryListRegex = /-\t-\t(?:\0.+\0)?([^\0]*)/gi
+
+async function getFilesUsingBinaryMergeDriver(
+  repository: Repository,
+  files: ReadonlyArray<IStatusEntry>
+) {
+  const { stdout } = await git(
+    ['check-attr', '--stdin', '-z', 'merge'],
+    repository.path,
+    'getConflictedFilesUsingBinaryMergeDriver',
+    {
+      stdin: files.map(f => f.path).join('\0'),
+    }
+  )
+
+  return createLogParser({ path: '', attr: '', value: '' })
+    .parse(stdout)
+    .filter(x => x.attr === 'merge' && x.value === 'binary')
+    .map(x => x.path)
+}
